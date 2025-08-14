@@ -1,0 +1,16 @@
+# Rust build artifacts
+**/target/
+
+# TIMS-TOF cache/output data
+**/output_precursors/
+
+# TIMS-TOF local caches
+.timstof_cache/
+.timstof_cache_optimized/
+**/.timstof_cache/
+**/.timstof_cache_optimized/
+
+# macOS
+.DS_Store
+
+
