@@ -23,7 +23,7 @@ use polars::prelude::*;
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Configurable parallel processing parameter
-    let parallel_threads = 32; // Set to 1 for sequential, 2+ for parallel processing
+    let parallel_threads = 16; // Set to 1 for sequential, 2+ for parallel processing
     
     // Initialize global thread pool based on parallel_threads setting
     if parallel_threads > 1 {
@@ -61,6 +61,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                         println!("  {} - {}", name, size_str);
                     }
                 }
+                return Ok(());
+            }
+            "--benchmark-cache" => {
+                let cache_manager = CacheManager::new().configure_for_threads(parallel_threads);
+                cache_manager.benchmark_cache(10 * 1024 * 1024)?; // 10MB test
                 return Ok(());
             }
             _ => {}
@@ -103,16 +108,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     // ================================ OPTIMIZED CACHE CONFIGURATION ================================
     
-    // Create optimized cache configuration based on parallel_threads
+    // Create truly optimized cache configuration (sequential I/O + smart compression)
     let cache_config = CacheConfig {
-        enable_compression: true,        // Enable LZ4 compression for faster I/O
-        compression_level: 4,           // Fast compression level (1-12, lower=faster)
-        buffer_size: if parallel_threads > 1 { 
-            1024 * 1024 * 128           // 128MB buffer for parallel processing
-        } else { 
-            1024 * 1024 * 64            // 64MB buffer for sequential processing
-        },
-        parallel_io: parallel_threads > 1, // Enable parallel I/O for multi-threaded mode
+        enable_compression: false,       // Disabled by default for maximum speed
+        buffer_size: 1024 * 1024 * 32,  // Optimal buffer size for sequential I/O
+        auto_compression: true,          // Smart compression only where beneficial
     };
     
     // Create cache manager with optimized configuration
@@ -122,21 +122,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ================================ DATA LOADING AND INDEXING ================================
     println!("\n========== DATA PREPARATION PHASE ==========");
     println!("Cache configuration:");
-    println!("  - Parallel I/O: {}", parallel_threads > 1);
-    println!("  - Compression: enabled (LZ4)");
-    println!("  - Buffer size: {} MB", 
-             if parallel_threads > 1 { 128 } else { 64 });
-    println!("  - Thread optimization: enabled");
+    println!("  - Sequential I/O: optimized for disk performance");
+    println!("  - Smart compression: MS2 only (where beneficial)");
+    println!("  - Buffer size: 32 MB (optimized for speed)");
+    println!("  - Thread optimization: CPU tasks only");
     
     let total_start = Instant::now();
     
     let (ms1_indexed, ms2_indexed_pairs) = if cache_manager.is_cache_valid(d_path) {
-        println!("Found valid cache, loading indexed data with optimizations...");
+        println!("Found valid cache, loading with sequential I/O optimization...");
         let cache_load_start = Instant::now();
         let result = cache_manager.load_indexed_data(d_path)?;
-        println!("✓ Optimized cache loading completed!");
-        println!("  - Load time: {:.3} seconds", cache_load_start.elapsed().as_secs_f32());
-        println!("  - Parallel mode: {}", parallel_threads > 1);
+        println!("✓ Sequential cache loading completed in {:.3}s!", cache_load_start.elapsed().as_secs_f32());
         result
     } else {
         println!("Cache invalid or non-existent, reading TimsTOF data...");
@@ -155,13 +152,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("Index building time: {:.5} seconds", index_start.elapsed().as_secs_f32());
         
         // Save to cache with optimizations
-        println!("\nSaving to optimized cache...");
+        println!("\nSaving to sequential-optimized cache...");
         let cache_save_start = Instant::now();
         cache_manager.save_indexed_data(d_path, &ms1_indexed, &ms2_indexed_pairs)?;
-        println!("✓ Optimized cache saving completed!");
-        println!("  - Save time: {:.3} seconds", cache_save_start.elapsed().as_secs_f32());
-        println!("  - Parallel mode: {}", parallel_threads > 1);
-        println!("  - Compression: enabled");
+        println!("✓ Sequential cache saving completed in {:.3}s!", cache_save_start.elapsed().as_secs_f32());
         
         (ms1_indexed, ms2_indexed_pairs)
     };
@@ -301,8 +295,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ================================ FINAL SUMMARY ================================
     println!("\n========== PROCESSING COMPLETE ==========");
     println!("🎯 Final Performance Summary:");
-    println!("  ├── Cache mode: {} (with LZ4 compression)", 
-             if parallel_threads > 1 { "Parallel" } else { "Sequential" });
+    println!("  ├── Cache mode: Sequential I/O (disk-optimized)");
     println!("  ├── Processing mode: {}", 
              if parallel_threads == 1 { "Sequential".to_string() } else { format!("Parallel ({} threads)", parallel_threads) });
     println!("  ├── Total precursors processed: {}", precursor_lib_data_list.len());
