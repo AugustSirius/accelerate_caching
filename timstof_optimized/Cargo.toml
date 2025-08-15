@@ -8,28 +8,43 @@ name = "read_bruker_data"
 path = "src/main.rs"
 
 [dependencies]
+# Core serialization and data handling
 bincode = "1.3"
-timsrust = "0.4.2" 
-csv = "1.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# TimsTOF data reading
+timsrust = "0.4.2"
+
+# File I/O and CSV processing
+csv = "1.3"
+
+# Date and time handling
 chrono = "0.4"
+
+# Parallel processing
 rayon = "1.8"
+
+# Data analysis and manipulation
 polars = { version = "0.37", features = ["lazy", "parquet", "csv", "strings", "temporal", "regex"] }
-ndarray = { version = "0.15", features = ["rayon", "serde"] }  # Added "serde" feature
+ndarray = { version = "0.15", features = ["rayon"] }
+
+# Performance optimizations
 num_cpus = "1.16"
 ahash = "0.8"
 bitvec = "1.0"
 parking_lot = "0.12"
-sysinfo = "0.29"
 rustc-hash = "1.1"
+
+# System information and memory management
+sysinfo = "0.29"
 jemalloc-ctl = "0.5"
+
+# Concurrency utilities
 crossbeam = "0.8"
 
-# New dependencies for optimized reading
-mimalloc = "0.1"  # High-performance memory allocator
-dashmap = "6.1"   # Lock-free concurrent hashmap
-crossbeam-channel = "0.5"  # High-performance channels for thread communication
+# NEW: Fast compression for cache optimization
+lz4_flex = "0.11"
 
 # Development builds (for debugging)
 [profile.dev]

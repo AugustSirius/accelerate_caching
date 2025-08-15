@@ -2,7 +2,7 @@ mod utils;
 mod cache;
 mod processing;
 
-use cache::CacheManager;
+use cache::{CacheManager, CacheConfig};
 use utils::{
     read_timstof_data, build_indexed_data, read_parquet_with_polars,
     library_records_to_dataframe, merge_library_and_report, get_unique_precursor_ids, 
@@ -21,11 +21,9 @@ use std::{error::Error, path::Path, time::Instant, env, fs::File};
 use ndarray::{Array2, Array3, Array4, s, Axis};
 use polars::prelude::*;
 
-// Note: Global allocator is now in utils.rs
-
 fn main() -> Result<(), Box<dyn Error>> {
     // Configurable parallel processing parameter
-    let parallel_threads = 32; // Set to 1 for sequential, 2+ for parallel processing
+    let parallel_threads = 16; // Set to 1 for sequential, 2+ for parallel processing
     
     // Initialize global thread pool based on parallel_threads setting
     if parallel_threads > 1 {
@@ -103,26 +101,50 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Using library file: {}", lib_file_path);
     println!("Using report file: {}", report_file_path);
     
-    // ================================ DATA LOADING AND INDEXING ================================
-    let cache_manager = CacheManager::new();
+    // ================================ OPTIMIZED CACHE CONFIGURATION ================================
     
+    // Create optimized cache configuration based on parallel_threads
+    let cache_config = CacheConfig {
+        enable_compression: true,        // Enable LZ4 compression for faster I/O
+        compression_level: 4,           // Fast compression level (1-12, lower=faster)
+        buffer_size: if parallel_threads > 1 { 
+            1024 * 1024 * 128           // 128MB buffer for parallel processing
+        } else { 
+            1024 * 1024 * 64            // 64MB buffer for sequential processing
+        },
+        parallel_io: parallel_threads > 1, // Enable parallel I/O for multi-threaded mode
+    };
+    
+    // Create cache manager with optimized configuration
+    let cache_manager = CacheManager::with_config(cache_config)
+        .configure_for_threads(parallel_threads);
+    
+    // ================================ DATA LOADING AND INDEXING ================================
     println!("\n========== DATA PREPARATION PHASE ==========");
+    println!("Cache configuration:");
+    println!("  - Parallel I/O: {}", parallel_threads > 1);
+    println!("  - Compression: enabled (LZ4)");
+    println!("  - Buffer size: {} MB", 
+             if parallel_threads > 1 { 128 } else { 64 });
+    println!("  - Thread optimization: enabled");
+    
     let total_start = Instant::now();
     
     let (ms1_indexed, ms2_indexed_pairs) = if cache_manager.is_cache_valid(d_path) {
-        println!("Found valid cache, loading indexed data directly...");
+        println!("Found valid cache, loading indexed data with optimizations...");
         let cache_load_start = Instant::now();
         let result = cache_manager.load_indexed_data(d_path)?;
-        println!("Cache loading time: {:.5} seconds", cache_load_start.elapsed().as_secs_f32());
+        println!("✓ Optimized cache loading completed!");
+        println!("  - Load time: {:.3} seconds", cache_load_start.elapsed().as_secs_f32());
+        println!("  - Parallel mode: {}", parallel_threads > 1);
         result
     } else {
         println!("Cache invalid or non-existent, reading TimsTOF data...");
-        println!("Using optimized reader with hybrid optimizations (DashMap + Zero-copy + MiMalloc)");
         
-        // Read raw data with optimized reader
+        // Read raw data
         let raw_data_start = Instant::now();
         let raw_data = read_timstof_data(d_path)?;
-        println!("Optimized raw data reading time: {:.5} seconds", raw_data_start.elapsed().as_secs_f32());
+        println!("Raw data reading time: {:.5} seconds", raw_data_start.elapsed().as_secs_f32());
         println!("  - MS1 data points: {}", raw_data.ms1_data.mz_values.len());
         println!("  - MS2 windows: {}", raw_data.ms2_windows.len());
         
@@ -132,15 +154,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         let (ms1_indexed, ms2_indexed_pairs) = build_indexed_data(raw_data)?;
         println!("Index building time: {:.5} seconds", index_start.elapsed().as_secs_f32());
         
-        // Save to cache
+        // Save to cache with optimizations
+        println!("\nSaving to optimized cache...");
         let cache_save_start = Instant::now();
         cache_manager.save_indexed_data(d_path, &ms1_indexed, &ms2_indexed_pairs)?;
-        println!("Cache saving time: {:.5} seconds", cache_save_start.elapsed().as_secs_f32());
+        println!("✓ Optimized cache saving completed!");
+        println!("  - Save time: {:.3} seconds", cache_save_start.elapsed().as_secs_f32());
+        println!("  - Parallel mode: {}", parallel_threads > 1);
+        println!("  - Compression: enabled");
         
         (ms1_indexed, ms2_indexed_pairs)
     };
     
-    println!("Total data preparation time: {:.5} seconds", total_start.elapsed().as_secs_f32());
+    println!("\n🚀 Total optimized data preparation time: {:.3} seconds", total_start.elapsed().as_secs_f32());
     
     // Create MS2 finder for fast chunk lookup
     let finder = FastChunkFinder::new(ms2_indexed_pairs)?;
@@ -271,11 +297,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     
     let batch_elapsed = batch_start.elapsed();
-    println!("\n========== BATCH PROCESSING SUMMARY ==========");
-    println!("Processing mode: {}", if parallel_threads == 1 { "Sequential".to_string() } else { format!("Parallel ({} threads)", parallel_threads) });
-    println!("Total batch processing time: {:.5} seconds", batch_elapsed.as_secs_f32());
-    println!("Average time per precursor: {:.5} seconds", 
+    
+    // ================================ FINAL SUMMARY ================================
+    println!("\n========== PROCESSING COMPLETE ==========");
+    println!("🎯 Final Performance Summary:");
+    println!("  ├── Cache mode: {} (with LZ4 compression)", 
+             if parallel_threads > 1 { "Parallel" } else { "Sequential" });
+    println!("  ├── Processing mode: {}", 
+             if parallel_threads == 1 { "Sequential".to_string() } else { format!("Parallel ({} threads)", parallel_threads) });
+    println!("  ├── Total precursors processed: {}", precursor_lib_data_list.len());
+    println!("  ├── Batch processing time: {:.3} seconds", batch_elapsed.as_secs_f32());
+    println!("  ├── Average time per precursor: {:.3} seconds", 
              batch_elapsed.as_secs_f32() / precursor_lib_data_list.len() as f32);
+    println!("  └── Total runtime: {:.3} seconds", total_start.elapsed().as_secs_f32());
+    
+    println!("\n✅ All processing completed successfully!");
+    println!("📁 Results saved to: {}/", output_dir);
     
     Ok(())
 }

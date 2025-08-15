@@ -8,154 +8,189 @@ use rayon::prelude::*;
 use csv::ReaderBuilder;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::time::Instant;
-use timsrust::{converters::{ConvertableDomain, Tof2MzConverter, Scan2ImConverter}, readers::{FrameReader, MetadataReader}, MSLevel};
+use timsrust::{converters::ConvertableDomain, readers::{FrameReader, MetadataReader}, MSLevel};
 use serde::{Serialize, Deserialize};
-use dashmap::DashMap;
-use crossbeam_channel::bounded;
-use parking_lot::Mutex;
-use mimalloc::MiMalloc;
 
-// Global allocator for better memory performance
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
-
-// Configuration constants
-const NUM_THREADS: usize = 32;
-const CHANNEL_BUFFER_SIZE: usize = 2000;
-
-// ============================================================================
-// Core Data Structures
-// ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimsTOFData {
-    pub rt_values_min: Vec<f32>,
-    pub mobility_values: Vec<f32>,
-    pub mz_values: Vec<f32>,
-    pub intensity_values: Vec<u32>,
-    pub frame_indices: Vec<u32>,
-    pub scan_indices: Vec<u32>,
+#[derive(Debug, Clone)]
+pub struct PrecursorLibData {
+    pub precursor_id: String,
+    pub im: f32,
+    pub rt: f32,
+    pub lib_records: Vec<LibraryRecord>,
+    pub ms1_data: MSDataArray,
+    pub ms2_data: MSDataArray,
+    pub precursor_info: Vec<f32>,
 }
 
-impl TimsTOFData {
-    pub fn new() -> Self {
-        TimsTOFData {
-            rt_values_min: Vec::new(),
-            mobility_values: Vec::new(),
-            mz_values: Vec::new(),
-            intensity_values: Vec::new(),
-            frame_indices: Vec::new(),
-            scan_indices: Vec::new(),
-        }
-    }
+pub fn prepare_precursor_lib_data(
+    library_records: &[LibraryRecord],
+    diann_precursor_ids: &[String],
+    assay_rt_dict: &HashMap<String, f32>,
+    assay_im_dict: &HashMap<String, f32>,
+    lib_cols: &LibCols,
+    max_precursors: usize,
+) -> Result<Vec<PrecursorLibData>, Box<dyn Error>> {
+    // 获取前N个unique precursor IDs
+    let unique_precursors: Vec<String> = diann_precursor_ids
+        .iter()
+        .take(max_precursors)
+        .cloned()
+        .collect();
     
-    pub fn with_capacity(capacity: usize) -> Self {
-        let aligned_cap = ((capacity + 15) / 16) * 16;
-        Self {
-            rt_values_min: Vec::with_capacity(aligned_cap),
-            mobility_values: Vec::with_capacity(aligned_cap),
-            mz_values: Vec::with_capacity(aligned_cap),
-            intensity_values: Vec::with_capacity(aligned_cap),
-            frame_indices: Vec::with_capacity(aligned_cap),
-            scan_indices: Vec::with_capacity(aligned_cap),
-        }
-    }
+    println!("Preparing library data for {} precursors...", unique_precursors.len());
     
-    pub fn preallocate_exact(capacity: usize) -> Self {
-        let mut data = Self::with_capacity(capacity);
-        data.rt_values_min.reserve_exact(capacity);
-        data.mobility_values.reserve_exact(capacity);
-        data.mz_values.reserve_exact(capacity);
-        data.intensity_values.reserve_exact(capacity);
-        data.frame_indices.reserve_exact(capacity);
-        data.scan_indices.reserve_exact(capacity);
-        data
-    }
+    // 并行处理每个precursor
+    let precursor_data_list: Vec<PrecursorLibData> = unique_precursors
+        .par_iter()
+        .filter_map(|precursor_id| {
+            // 获取该precursor的所有library records
+            let each_lib_data: Vec<LibraryRecord> = library_records
+                .iter()
+                .filter(|record| &record.transition_group_id == precursor_id)
+                .cloned()
+                .collect();
+            
+            if each_lib_data.is_empty() {
+                return None;
+            }
+            
+            // 获取RT和IM
+            let rt = assay_rt_dict.get(precursor_id).copied().unwrap_or(0.0);
+            let im = assay_im_dict.get(precursor_id).copied().unwrap_or(0.0);
+            
+            // 构建library matrices
+            match build_lib_matrix(&each_lib_data, lib_cols, 5.0, 1801.0, 20) {
+                Ok((precursors_list, ms1_data_list, ms2_data_list, precursor_info_list)) => {
+                    if !precursors_list.is_empty() {
+                        Some(PrecursorLibData {
+                            precursor_id: precursor_id.clone(),
+                            im,
+                            rt,
+                            lib_records: each_lib_data,
+                            ms1_data: ms1_data_list[0].clone(),
+                            ms2_data: ms2_data_list[0].clone(),
+                            precursor_info: precursor_info_list[0].clone(),
+                        })
+                    } else {
+                        None
+                    }
+                },
+                Err(_) => None,
+            }
+        })
+        .collect();
     
-    #[inline(always)]
-    unsafe fn append_unchecked(&mut self, other: &mut Self) {
-        let len = self.rt_values_min.len();
-        let other_len = other.rt_values_min.len();
-        let new_len = len + other_len;
-        
-        self.rt_values_min.reserve(other_len);
-        self.mobility_values.reserve(other_len);
-        self.mz_values.reserve(other_len);
-        self.intensity_values.reserve(other_len);
-        self.frame_indices.reserve(other_len);
-        self.scan_indices.reserve(other_len);
-        
-        std::ptr::copy_nonoverlapping(
-            other.rt_values_min.as_ptr(),
-            self.rt_values_min.as_mut_ptr().add(len),
-            other_len
-        );
-        std::ptr::copy_nonoverlapping(
-            other.mobility_values.as_ptr(),
-            self.mobility_values.as_mut_ptr().add(len),
-            other_len
-        );
-        std::ptr::copy_nonoverlapping(
-            other.mz_values.as_ptr(),
-            self.mz_values.as_mut_ptr().add(len),
-            other_len
-        );
-        std::ptr::copy_nonoverlapping(
-            other.intensity_values.as_ptr(),
-            self.intensity_values.as_mut_ptr().add(len),
-            other_len
-        );
-        std::ptr::copy_nonoverlapping(
-            other.frame_indices.as_ptr(),
-            self.frame_indices.as_mut_ptr().add(len),
-            other_len
-        );
-        std::ptr::copy_nonoverlapping(
-            other.scan_indices.as_ptr(),
-            self.scan_indices.as_mut_ptr().add(len),
-            other_len
-        );
-        
-        self.rt_values_min.set_len(new_len);
-        self.mobility_values.set_len(new_len);
-        self.mz_values.set_len(new_len);
-        self.intensity_values.set_len(new_len);
-        self.frame_indices.set_len(new_len);
-        self.scan_indices.set_len(new_len);
-    }
-    
-    fn merge_from(&mut self, other: TimsTOFData) {
-        self.rt_values_min.extend(other.rt_values_min);
-        self.mobility_values.extend(other.mobility_values);
-        self.mz_values.extend(other.mz_values);
-        self.intensity_values.extend(other.intensity_values);
-        self.frame_indices.extend(other.frame_indices);
-        self.scan_indices.extend(other.scan_indices);
-    }
-    
-    pub fn merge(data_list: Vec<TimsTOFData>) -> Self {
-        let mut merged = TimsTOFData::new();
-        
-        for data in data_list {
-            merged.rt_values_min.extend(data.rt_values_min);
-            merged.mobility_values.extend(data.mobility_values);
-            merged.mz_values.extend(data.mz_values);
-            merged.intensity_values.extend(data.intensity_values);
-            merged.frame_indices.extend(data.frame_indices);
-            merged.scan_indices.extend(data.scan_indices);
-        }
-        
-        merged
-    }
+    Ok(precursor_data_list)
 }
 
+// ============================================================================
+// TimsTOF 数据读取相关结构体和函数
+// ============================================================================
+
+/// 原始 TimsTOF 数据结构，用于存储从 .d 文件读取的原始数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimsTOFRawData {
     pub ms1_data: TimsTOFData,
     pub ms2_windows: Vec<((f32, f32), TimsTOFData)>,
 }
+
+/// 读取 TimsTOF .d 文件夹，返回原始数据
+pub fn read_timstof_data(d_folder: &Path) -> Result<TimsTOFRawData, Box<dyn Error>> {
+    let tdf_path = d_folder.join("analysis.tdf");
+    let meta = MetadataReader::new(&tdf_path)?;
+    let mz_cv = Arc::new(meta.mz_converter);
+    let im_cv = Arc::new(meta.im_converter);
+    
+    let frames = FrameReader::new(d_folder)?;
+    let n_frames = frames.len();
+    
+    let splits: Vec<FrameSplit> = (0..n_frames).into_par_iter().map(|idx| {
+        let frame = frames.get(idx).expect("frame read");
+        let rt_min = frame.rt_in_seconds as f32 / 60.0;
+        let mut ms1 = TimsTOFData::new();
+        let mut ms2_pairs: Vec<((u32,u32), TimsTOFData)> = Vec::new();
+        
+        match frame.ms_level {
+            MSLevel::MS1 => {
+                let n_peaks = frame.tof_indices.len();
+                ms1 = TimsTOFData::with_capacity(n_peaks);
+                for (p_idx, (&tof, &intensity)) in frame.tof_indices.iter().zip(frame.intensities.iter()).enumerate() {
+                    let mz = mz_cv.convert(tof as f64) as f32;
+                    let scan = find_scan_for_index(p_idx, &frame.scan_offsets);
+                    let im = im_cv.convert(scan as f64) as f32;
+                    ms1.rt_values_min.push(rt_min);
+                    ms1.mobility_values.push(im);
+                    ms1.mz_values.push(mz);
+                    ms1.intensity_values.push(intensity);
+                    ms1.frame_indices.push(frame.index as u32);
+                    ms1.scan_indices.push(scan as u32);
+                }
+            }
+            MSLevel::MS2 => {
+                let qs = &frame.quadrupole_settings;
+                ms2_pairs.reserve(qs.isolation_mz.len());
+                for win in 0..qs.isolation_mz.len() {
+                    if win >= qs.isolation_width.len() { break; }
+                    let prec_mz = qs.isolation_mz[win] as f32;
+                    let width = qs.isolation_width[win] as f32;
+                    let low = prec_mz - width * 0.5;
+                    let high = prec_mz + width * 0.5;
+                    let key = (quantize(low), quantize(high));
+                    
+                    let mut td = TimsTOFData::new();
+                    for (p_idx, (&tof, &intensity)) in frame.tof_indices.iter().zip(frame.intensities.iter()).enumerate() {
+                        let scan = find_scan_for_index(p_idx, &frame.scan_offsets);
+                        if scan < qs.scan_starts[win] || scan > qs.scan_ends[win] { continue; }
+                        let mz = mz_cv.convert(tof as f64) as f32;
+                        let im = im_cv.convert(scan as f64) as f32;
+                        td.rt_values_min.push(rt_min);
+                        td.mobility_values.push(im);
+                        td.mz_values.push(mz);
+                        td.intensity_values.push(intensity);
+                        td.frame_indices.push(frame.index as u32);
+                        td.scan_indices.push(scan as u32);
+                    }
+                    ms2_pairs.push((key, td));
+                }
+            }
+            _ => {}
+        }
+        FrameSplit { ms1, ms2: ms2_pairs }
+    }).collect();
+    
+    let ms1_size_estimate: usize = splits.par_iter().map(|s| s.ms1.mz_values.len()).sum();
+    let mut global_ms1 = TimsTOFData::with_capacity(ms1_size_estimate);
+    let mut ms2_hash: HashMap<(u32,u32), TimsTOFData> = HashMap::new();
+    
+    for split in splits {
+        global_ms1.rt_values_min.extend(split.ms1.rt_values_min);
+        global_ms1.mobility_values.extend(split.ms1.mobility_values);
+        global_ms1.mz_values.extend(split.ms1.mz_values);
+        global_ms1.intensity_values.extend(split.ms1.intensity_values);
+        global_ms1.frame_indices.extend(split.ms1.frame_indices);
+        global_ms1.scan_indices.extend(split.ms1.scan_indices);
+        
+        for (key, mut td) in split.ms2 {
+            ms2_hash.entry(key).or_insert_with(TimsTOFData::new).merge_from(&mut td);
+        }
+    }
+    
+    let mut ms2_vec = Vec::with_capacity(ms2_hash.len());
+    for ((q_low, q_high), td) in ms2_hash {
+        let low = q_low as f32 / 10_000.0;
+        let high = q_high as f32 / 10_000.0;
+        ms2_vec.push(((low, high), td));
+    }
+    
+    Ok(TimsTOFRawData {
+        ms1_data: global_ms1,
+        ms2_windows: ms2_vec,
+    })
+}
+
+// ============================================================================
+// Optimized IndexedTimsTOFData with all u32 indices
+// ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexedTimsTOFData {
@@ -168,6 +203,7 @@ pub struct IndexedTimsTOFData {
 }
 
 impl IndexedTimsTOFData {
+    /// Empty constructor
     pub fn new() -> Self {
         Self {
             rt_values_min: Vec::new(),
@@ -179,12 +215,15 @@ impl IndexedTimsTOFData {
         }
     }
 
+    /// Build once ► all columns reordered into the same m/z-ascending order.
     pub fn from_timstof_data(data: TimsTOFData) -> Self {
         let n_peaks = data.mz_values.len();
         
+        // 1. Build permutation for m/z sorting
         let mut order: Vec<usize> = (0..n_peaks).collect();
         order.sort_by(|&a, &b| data.mz_values[a].partial_cmp(&data.mz_values[b]).unwrap());
 
+        // 2. Helper functions to reorder in one pass
         fn reorder_f32(src: &[f32], ord: &[usize]) -> Vec<f32> {
             ord.iter().map(|&i| src[i]).collect()
         }
@@ -193,6 +232,7 @@ impl IndexedTimsTOFData {
             ord.iter().map(|&i| src[i]).collect()
         }
 
+        // 3. Apply permutation to all columns
         Self {
             rt_values_min: reorder_f32(&data.rt_values_min, &order),
             mobility_values: reorder_f32(&data.mobility_values, &order),
@@ -203,6 +243,7 @@ impl IndexedTimsTOFData {
         }
     }
 
+    /// Locate the slice boundaries (binary search)
     #[inline]
     fn range_indices(&self, mz_min: f32, mz_max: f32) -> std::ops::Range<usize> {
         let start = self.mz_values.partition_point(|&x| x < mz_min);
@@ -210,6 +251,7 @@ impl IndexedTimsTOFData {
         start..end
     }
 
+    /// Extract peaks whose m/z is within [mz_min, mz_max]
     pub fn slice_by_mz_range(&self, mz_min: f32, mz_max: f32) -> TimsTOFData {
         let range = self.range_indices(mz_min, mz_max);
         let cap = range.len();
@@ -224,11 +266,12 @@ impl IndexedTimsTOFData {
         td
     }
 
+    /// Combined m/z and ion mobility range filtering (NEW - optimized)
     pub fn slice_by_mz_im_range(&self, mz_min: f32, mz_max: f32, im_min: f32, im_max: f32) -> TimsTOFData {
         let range = self.range_indices(mz_min, mz_max);
         
         let indices: Vec<usize> = (range.start..range.end)
-            .into_par_iter()
+            .into_par_iter()         // Use parallel filtering for ion mobility
             .filter(|&i| {
                 let im = self.mobility_values[i];
                 im >= im_min && im <= im_max
@@ -238,6 +281,7 @@ impl IndexedTimsTOFData {
         let cap = indices.len();
         let mut td = TimsTOFData::with_capacity(cap);
         
+        // Copy only the filtered indices
         for &i in &indices {
             td.rt_values_min.push(self.rt_values_min[i]);
             td.mobility_values.push(self.mobility_values[i]);
@@ -250,64 +294,39 @@ impl IndexedTimsTOFData {
         td
     }
 
+    /// Multiply m/z by 1000 (monotonic transform keeps sorting)
     pub fn convert_mz_to_integer(&mut self) {
         self.mz_values.iter_mut().for_each(|v| *v = (*v * 1000.0).ceil());
     }
 
+    /// Ion mobility filtering (now uses slice_by_mz_im_range internally)
     pub fn filter_by_im_range(&self, im_min: f32, im_max: f32) -> TimsTOFData {
+        // Use the full m/z range with IM filtering
         self.slice_by_mz_im_range(f32::NEG_INFINITY, f32::INFINITY, im_min, im_max)
     }
 }
 
-// ============================================================================
-// Helper structures for optimized reading
-// ============================================================================
-
-#[derive(Clone)]
-enum ProcessedFrame {
-    MS1(usize, TimsTOFData),
-    MS2(usize, Vec<((u32, u32), TimsTOFData)>),
+/// 构建索引数据
+pub fn build_indexed_data(raw_data: TimsTOFRawData) -> Result<(IndexedTimsTOFData, Vec<((f32, f32), IndexedTimsTOFData)>), Box<dyn Error>> {
+    // 为 MS1 数据构建索引
+    let ms1_indexed = IndexedTimsTOFData::from_timstof_data(raw_data.ms1_data);
+    
+    // 为 MS2 窗口构建索引
+    let ms2_indexed_pairs: Vec<((f32, f32), IndexedTimsTOFData)> = raw_data.ms2_windows
+        .into_par_iter()
+        .map(|((low, high), data)| ((low, high), IndexedTimsTOFData::from_timstof_data(data)))
+        .collect();
+    
+    Ok((ms1_indexed, ms2_indexed_pairs))
 }
 
-struct FrameProcessor {
-    mz_cv: Arc<Tof2MzConverter>,
-    im_cv: Arc<Scan2ImConverter>,
-}
+// ============================================================================
+// 原有的数据结构和工具函数
+// ============================================================================
 
-impl FrameProcessor {
-    #[inline(always)]
-    fn process_peaks_batch(
-        &self,
-        tof_indices: &[u32],
-        intensities: &[u32],
-        scan_offsets: &[usize],
-        rt_min: f32,
-        frame_index: u32,
-        scan_filter: Option<(usize, usize)>,
-    ) -> TimsTOFData {
-        let n_peaks = tof_indices.len();
-        let mut data = TimsTOFData::with_capacity(n_peaks);
-        
-        for (p_idx, (&tof, &intensity)) in tof_indices.iter().zip(intensities.iter()).enumerate() {
-            let scan = find_scan_for_index(p_idx, scan_offsets);
-            
-            if let Some((start, end)) = scan_filter {
-                if scan < start || scan > end { continue; }
-            }
-            
-            let mz = self.mz_cv.convert(tof as f64) as f32;
-            let im = self.im_cv.convert(scan as f64) as f32;
-            
-            data.rt_values_min.push(rt_min);
-            data.mobility_values.push(im);
-            data.mz_values.push(mz);
-            data.intensity_values.push(intensity);
-            data.frame_indices.push(frame_index);
-            data.scan_indices.push(scan as u32);
-        }
-        
-        data
-    }
+#[inline]
+pub fn quantize(x: f32) -> u32 { 
+    (x * 10_000.0).round() as u32 
 }
 
 pub struct FrameSplit {
@@ -330,292 +349,57 @@ impl MergeFrom for TimsTOFData {
     }
 }
 
-// ============================================================================
-// Helper functions
-// ============================================================================
-
-#[inline(always)]
-pub fn quantize(x: f32) -> u32 { 
-    (x * 10_000.0).round() as u32 
+// TimsTOF数据结构 - now with u32 indices
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimsTOFData {
+    pub rt_values_min: Vec<f32>,
+    pub mobility_values: Vec<f32>,
+    pub mz_values: Vec<f32>,
+    pub intensity_values: Vec<u32>,
+    pub frame_indices: Vec<u32>,    // Changed from Vec<usize> to Vec<u32>
+    pub scan_indices: Vec<u32>,      // Changed from Vec<usize> to Vec<u32>
 }
 
-pub fn find_scan_for_index(index: usize, scan_offsets: &[usize]) -> usize {
-    for (scan, window) in scan_offsets.windows(2).enumerate() {
-        if index >= window[0] && index < window[1] {
-            return scan;
-        }
-    }
-    scan_offsets.len() - 1
-}
-
-fn estimate_total_peaks(frames: &FrameReader) -> (usize, usize) {
-    let sample_size = std::cmp::min(50, frames.len());
-    let mut ms1_sum = 0;
-    let mut ms2_sum = 0;
-    let mut ms1_count = 0;
-    let mut ms2_count = 0;
-    
-    for idx in 0..sample_size {
-        if let Ok(frame) = frames.get(idx) {
-            match frame.ms_level {
-                MSLevel::MS1 => {
-                    ms1_sum += frame.tof_indices.len();
-                    ms1_count += 1;
-                }
-                MSLevel::MS2 => {
-                    ms2_sum += frame.tof_indices.len();
-                    ms2_count += 1;
-                }
-                _ => {}
-            }
+impl TimsTOFData {
+    pub fn new() -> Self {
+        TimsTOFData {
+            rt_values_min: Vec::new(),
+            mobility_values: Vec::new(),
+            mz_values: Vec::new(),
+            intensity_values: Vec::new(),
+            frame_indices: Vec::new(),
+            scan_indices: Vec::new(),
         }
     }
     
-    let avg_ms1 = if ms1_count > 0 { ms1_sum / ms1_count } else { 10000 };
-    let avg_ms2 = if ms2_count > 0 { ms2_sum / ms2_count } else { 10000 };
-    
-    let total_frames = frames.len();
-    let estimated_ms1 = avg_ms1 * (total_frames * 2 / 5);
-    let estimated_ms2 = avg_ms2 * (total_frames * 3 / 5);
-    
-    (estimated_ms1, estimated_ms2)
-}
-
-// ============================================================================
-// OPTIMIZED TimsTOF Data Reading Function
-// ============================================================================
-
-pub fn read_timstof_data(d_folder: &Path) -> Result<TimsTOFRawData, Box<dyn Error>> {
-    let total_start = Instant::now();
-    
-    println!("Initializing metadata readers...");
-    let meta_start = Instant::now();
-    let tdf_path = d_folder.join("analysis.tdf");
-    let meta = MetadataReader::new(&tdf_path)?;
-    let mz_cv = Arc::new(meta.mz_converter);
-    let im_cv = Arc::new(meta.im_converter);
-    println!("  Metadata initialization: {:.3}s", meta_start.elapsed().as_secs_f32());
-    
-    println!("Initializing frame reader...");
-    let frame_reader_start = Instant::now();
-    let frames = Arc::new(FrameReader::new(d_folder)?);
-    let n_frames = frames.len();
-    println!("  Frame reader initialization: {:.3}s", frame_reader_start.elapsed().as_secs_f32());
-    println!("  Total frames to process: {}", n_frames);
-    
-    println!("Estimating data size for pre-allocation...");
-    let (ms1_estimate, _ms2_estimate) = estimate_total_peaks(&frames);
-    println!("  Estimated MS1 peaks: ~{}", ms1_estimate);
-    
-    println!("Processing frames with hybrid optimizations ({} threads)...", NUM_THREADS);
-    let process_start = Instant::now();
-    
-    let (sender, receiver) = bounded(CHANNEL_BUFFER_SIZE);
-    let processed_count = Arc::new(AtomicUsize::new(0));
-    
-    let ms1_accumulator = Arc::new(Mutex::new(Vec::with_capacity(n_frames)));
-    let ms2_map = Arc::new(DashMap::with_capacity(100));
-    
-    let ms1_acc_clone = Arc::clone(&ms1_accumulator);
-    let ms2_map_clone = Arc::clone(&ms2_map);
-    let processed_clone = Arc::clone(&processed_count);
-    
-    let aggregator_handle = std::thread::spawn(move || {
-        let mut frame_buffer: Vec<Option<ProcessedFrame>> = vec![None; n_frames];
-        let mut next_frame = 0usize;
-        
-        while let Ok(frame_data) = receiver.recv() {
-            match frame_data {
-                ProcessedFrame::MS1(idx, data) => {
-                    frame_buffer[idx] = Some(ProcessedFrame::MS1(idx, data));
-                }
-                ProcessedFrame::MS2(idx, pairs) => {
-                    frame_buffer[idx] = Some(ProcessedFrame::MS2(idx, pairs));
-                }
-            }
-            
-            while next_frame < n_frames {
-                if let Some(frame) = frame_buffer[next_frame].take() {
-                    match frame {
-                        ProcessedFrame::MS1(_, data) => {
-                            if !data.mz_values.is_empty() {
-                                ms1_acc_clone.lock().push(data);
-                            }
-                        }
-                        ProcessedFrame::MS2(_, pairs) => {
-                            for (key, data) in pairs {
-                                if !data.mz_values.is_empty() {
-                                    ms2_map_clone.entry(key)
-                                        .or_insert_with(|| Arc::new(Mutex::new(TimsTOFData::new())))
-                                        .lock()
-                                        .merge_from(data);
-                                }
-                            }
-                        }
-                    }
-                    next_frame += 1;
-                    processed_clone.fetch_add(1, AtomicOrdering::Relaxed);
-                } else {
-                    break;
-                }
-            }
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            rt_values_min: Vec::with_capacity(capacity),
+            mobility_values: Vec::with_capacity(capacity),
+            mz_values: Vec::with_capacity(capacity),
+            intensity_values: Vec::with_capacity(capacity),
+            frame_indices: Vec::with_capacity(capacity),
+            scan_indices: Vec::with_capacity(capacity),
         }
-        
-        for frame in frame_buffer.into_iter().skip(next_frame) {
-            if let Some(frame_data) = frame {
-                match frame_data {
-                    ProcessedFrame::MS1(_, data) => {
-                        if !data.mz_values.is_empty() {
-                            ms1_acc_clone.lock().push(data);
-                        }
-                    }
-                    ProcessedFrame::MS2(_, pairs) => {
-                        for (key, data) in pairs {
-                            if !data.mz_values.is_empty() {
-                                ms2_map_clone.entry(key)
-                                    .or_insert_with(|| Arc::new(Mutex::new(TimsTOFData::new())))
-                                    .lock()
-                                    .merge_from(data);
-                            }
-                        }
-                    }
-                }
-                processed_clone.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-        }
-    });
-    
-    (0..n_frames).into_par_iter().for_each(|idx| {
-        let processor = FrameProcessor {
-            mz_cv: Arc::clone(&mz_cv),
-            im_cv: Arc::clone(&im_cv),
-        };
-        
-        let frame = match frames.get(idx) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        
-        let rt_min = frame.rt_in_seconds as f32 / 60.0;
-        
-        match frame.ms_level {
-            MSLevel::MS1 => {
-                let ms1 = processor.process_peaks_batch(
-                    &frame.tof_indices,
-                    &frame.intensities,
-                    &frame.scan_offsets,
-                    rt_min,
-                    frame.index as u32,
-                    None,
-                );
-                
-                if !ms1.mz_values.is_empty() {
-                    let _ = sender.send(ProcessedFrame::MS1(idx, ms1));
-                }
-            }
-            MSLevel::MS2 => {
-                let qs = &frame.quadrupole_settings;
-                let mut ms2_pairs = Vec::with_capacity(qs.isolation_mz.len());
-                
-                for win in 0..qs.isolation_mz.len() {
-                    if win >= qs.isolation_width.len() { break; }
-                    
-                    let prec_mz = qs.isolation_mz[win] as f32;
-                    let width = qs.isolation_width[win] as f32;
-                    let low = prec_mz - width * 0.5;
-                    let high = prec_mz + width * 0.5;
-                    let key = (quantize(low), quantize(high));
-                    
-                    let td = processor.process_peaks_batch(
-                        &frame.tof_indices,
-                        &frame.intensities,
-                        &frame.scan_offsets,
-                        rt_min,
-                        frame.index as u32,
-                        Some((qs.scan_starts[win], qs.scan_ends[win])),
-                    );
-                    
-                    if !td.mz_values.is_empty() {
-                        ms2_pairs.push((key, td));
-                    }
-                }
-                
-                if !ms2_pairs.is_empty() {
-                    let _ = sender.send(ProcessedFrame::MS2(idx, ms2_pairs));
-                }
-            }
-            _ => {}
-        }
-    });
-    
-    drop(sender);
-    aggregator_handle.join().unwrap();
-    
-    println!("  Frame processing: {:.3}s", process_start.elapsed().as_secs_f32());
-    println!("  Frames processed: {}", processed_count.load(AtomicOrdering::Relaxed));
-    
-    println!("Finalizing data structures with zero-copy merge...");
-    let finalize_start = Instant::now();
-    
-    let ms1_chunks = ms1_accumulator.lock();
-    let actual_ms1_size: usize = ms1_chunks.iter().map(|c| c.mz_values.len()).sum();
-    let mut global_ms1 = TimsTOFData::preallocate_exact(actual_ms1_size);
-    
-    for mut chunk in ms1_chunks.clone() {
-        unsafe { global_ms1.append_unchecked(&mut chunk); }
     }
     
-    let mut ms2_vec = Vec::with_capacity(ms2_map.len());
-    ms2_map.iter().for_each(|entry| {
-        let (q_low, q_high) = *entry.key();
-        let low = q_low as f32 / 10_000.0;
-        let high = q_high as f32 / 10_000.0;
-        let data = entry.value().lock().clone();
-        ms2_vec.push(((low, high), data));
-    });
-    
-    println!("  Data finalization: {:.3}s", finalize_start.elapsed().as_secs_f32());
-    
-    println!("\n========== Data Summary ==========");
-    println!("MS1 data points: {}", global_ms1.mz_values.len());
-    println!("MS2 windows: {}", ms2_vec.len());
-    
-    let total_ms2_points: usize = ms2_vec.iter().map(|(_, td)| td.mz_values.len()).sum();
-    println!("MS2 data points: {}", total_ms2_points);
-    println!("Total processing time: {:.3}s", total_start.elapsed().as_secs_f32());
-    
-    Ok(TimsTOFRawData {
-        ms1_data: global_ms1,
-        ms2_windows: ms2_vec,
-    })
+    pub fn merge(data_list: Vec<TimsTOFData>) -> Self {
+        let mut merged = TimsTOFData::new();
+        
+        for data in data_list {
+            merged.rt_values_min.extend(data.rt_values_min);
+            merged.mobility_values.extend(data.mobility_values);
+            merged.mz_values.extend(data.mz_values);
+            merged.intensity_values.extend(data.intensity_values);
+            merged.frame_indices.extend(data.frame_indices);
+            merged.scan_indices.extend(data.scan_indices);
+        }
+        
+        merged
+    }
 }
 
-pub fn build_indexed_data(raw_data: TimsTOFRawData) -> Result<(IndexedTimsTOFData, Vec<((f32, f32), IndexedTimsTOFData)>), Box<dyn Error>> {
-    let ms1_indexed = IndexedTimsTOFData::from_timstof_data(raw_data.ms1_data);
-    
-    let ms2_indexed_pairs: Vec<((f32, f32), IndexedTimsTOFData)> = raw_data.ms2_windows
-        .into_par_iter()
-        .map(|((low, high), data)| ((low, high), IndexedTimsTOFData::from_timstof_data(data)))
-        .collect();
-    
-    Ok((ms1_indexed, ms2_indexed_pairs))
-}
-
-// ============================================================================
-// Library Processing Structures and Functions
-// ============================================================================
-
-#[derive(Debug, Clone)]
-pub struct PrecursorLibData {
-    pub precursor_id: String,
-    pub im: f32,
-    pub rt: f32,
-    pub lib_records: Vec<LibraryRecord>,
-    pub ms1_data: MSDataArray,
-    pub ms2_data: MSDataArray,
-    pub precursor_info: Vec<f32>,
-}
-
+// 常量定义
 pub const MS1_ISOTOPE_COUNT: usize = 6;
 pub const FRAGMENT_VARIANTS: usize = 3;
 pub const MS1_TYPE_MARKER: f32 = 5.0;
@@ -624,6 +408,7 @@ pub const VARIANT_ORIGINAL: f32 = 2.0;
 pub const VARIANT_LIGHT: f32 = 3.0;
 pub const VARIANT_HEAVY: f32 = 4.0;
 
+// 库列名映射结构体
 #[derive(Debug, Clone)]
 pub struct LibCols {
     pub precursor_mz_col: &'static str,
@@ -683,60 +468,13 @@ pub struct LibraryRecord {
     pub other_columns: HashMap<String, String>,
 }
 
-pub fn prepare_precursor_lib_data(
-    library_records: &[LibraryRecord],
-    diann_precursor_ids: &[String],
-    assay_rt_dict: &HashMap<String, f32>,
-    assay_im_dict: &HashMap<String, f32>,
-    lib_cols: &LibCols,
-    max_precursors: usize,
-) -> Result<Vec<PrecursorLibData>, Box<dyn Error>> {
-    let unique_precursors: Vec<String> = diann_precursor_ids
-        .iter()
-        .take(max_precursors)
-        .cloned()
-        .collect();
-    
-    println!("Preparing library data for {} precursors...", unique_precursors.len());
-    
-    let precursor_data_list: Vec<PrecursorLibData> = unique_precursors
-        .par_iter()
-        .filter_map(|precursor_id| {
-            let each_lib_data: Vec<LibraryRecord> = library_records
-                .iter()
-                .filter(|record| &record.transition_group_id == precursor_id)
-                .cloned()
-                .collect();
-            
-            if each_lib_data.is_empty() {
-                return None;
-            }
-            
-            let rt = assay_rt_dict.get(precursor_id).copied().unwrap_or(0.0);
-            let im = assay_im_dict.get(precursor_id).copied().unwrap_or(0.0);
-            
-            match build_lib_matrix(&each_lib_data, lib_cols, 5.0, 1801.0, 20) {
-                Ok((precursors_list, ms1_data_list, ms2_data_list, precursor_info_list)) => {
-                    if !precursors_list.is_empty() {
-                        Some(PrecursorLibData {
-                            precursor_id: precursor_id.clone(),
-                            im,
-                            rt,
-                            lib_records: each_lib_data,
-                            ms1_data: ms1_data_list[0].clone(),
-                            ms2_data: ms2_data_list[0].clone(),
-                            precursor_info: precursor_info_list[0].clone(),
-                        })
-                    } else {
-                        None
-                    }
-                },
-                Err(_) => None,
-            }
-        })
-        .collect();
-    
-    Ok(precursor_data_list)
+pub fn find_scan_for_index(index: usize, scan_offsets: &[usize]) -> usize {
+    for (scan, window) in scan_offsets.windows(2).enumerate() {
+        if index >= window[0] && index < window[1] {
+            return scan;
+        }
+    }
+    scan_offsets.len() - 1
 }
 
 pub fn intercept_frags_sort(mut fragment_list: Vec<f32>, max_length: usize) -> Vec<f32> {
@@ -790,10 +528,8 @@ pub fn get_lib_col_dict() -> HashMap<&'static str, &'static str> {
     lib_col_dict
 }
 
-// ============================================================================
-// MS Data Processing Functions
-// ============================================================================
-
+// ... 继续包含所有其他的辅助函数 ...
+// Helper functions for MS data processing
 pub fn build_ms1_data(fragment_list: &[Vec<f32>], isotope_range: f32, max_mz: f32) -> MSDataArray {
     let first_fragment = &fragment_list[0];
     let charge = first_fragment[1];
@@ -986,10 +722,6 @@ pub fn build_lib_matrix(
     
     Ok((all_precursors, all_ms1_data, all_ms2_data, all_precursor_info))
 }
-
-// ============================================================================
-// Matrix Building Functions
-// ============================================================================
 
 pub fn build_precursors_matrix_step1(
     ms1_data_list: &[MSDataArray], 
@@ -1367,10 +1099,9 @@ pub fn build_precursors_matrix_step3(
     Ok((re_ms1_data_tensor, re_ms2_data_tensor, ms1_extract_width_range_list, ms2_extract_width_range_list))
 }
 
-// ============================================================================
-// Data Frame Processing Functions
-// ============================================================================
 
+
+// Functions moved from main.rs
 pub fn read_parquet_with_polars(file_path: &str) -> PolarsResult<DataFrame> {
     let file = File::open(file_path)?;
     let mut df = ParquetReader::new(file).finish()?;
@@ -1426,6 +1157,7 @@ pub fn process_library_fast(file_path: &str) -> Result<Vec<LibraryRecord>, Box<d
         column_indices.insert(header, i);
     }
     
+    // Get library column mapping
     let lib_col_dict = get_lib_col_dict();
     let mut mapped_indices: HashMap<&str, usize> = HashMap::new();
     for (old_col, new_col) in &lib_col_dict {
@@ -1436,6 +1168,7 @@ pub fn process_library_fast(file_path: &str) -> Result<Vec<LibraryRecord>, Box<d
     
     let fragment_number_idx = column_indices.get("FragmentNumber").copied();
     
+    // Read all records into memory first
     let mut byte_records = Vec::new();
     for result in reader.byte_records() {
         byte_records.push(result?);
@@ -1443,6 +1176,7 @@ pub fn process_library_fast(file_path: &str) -> Result<Vec<LibraryRecord>, Box<d
     
     eprintln!("Processing {} library records...", byte_records.len());
     
+    // Process records in parallel
     let records: Vec<LibraryRecord> = byte_records.par_iter().map(|record| {
         let mut rec = LibraryRecord {
             transition_group_id: String::new(),
@@ -1463,6 +1197,7 @@ pub fn process_library_fast(file_path: &str) -> Result<Vec<LibraryRecord>, Box<d
             other_columns: HashMap::new(),
         };
         
+        // Fill fields from mapped columns
         if let Some(&idx) = mapped_indices.get("PeptideSequence") { 
             if let Some(val) = record.get(idx) { 
                 rec.peptide_sequence = String::from_utf8_lossy(val).into_owned(); 
@@ -1536,6 +1271,7 @@ pub fn process_library_fast(file_path: &str) -> Result<Vec<LibraryRecord>, Box<d
             }
         }
         
+        // Generate transition_group_id
         rec.transition_group_id = format!("{}{}", rec.full_unimod_peptide_name, rec.precursor_charge);
         rec
     }).collect();
@@ -1586,9 +1322,7 @@ pub fn create_rt_im_dicts(df: &DataFrame) -> PolarsResult<(HashMap<String, f32>,
     Ok((rt_dict, im_dict))
 }
 
-// ============================================================================
-// Utility Functions
-// ============================================================================
+// Add these functions to utils.rs after the existing code
 
 pub fn get_rt_list(mut lst: Vec<f32>, target: f32) -> Vec<f32> {
     lst.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
@@ -1679,6 +1413,8 @@ pub fn build_frag_info(
     let ms2_shape = ext_ms2_precursors_frag_rt_matrix.shape().to_vec();
     
     let batch = ms1_shape[0];
+    let ms1_rows = ms1_shape[1];
+    let ms2_rows = ms2_shape[1];
     
     let orig_ms1_shape = ms1_data_tensor.shape();
     let orig_ms2_shape = ms2_data_tensor.shape();
